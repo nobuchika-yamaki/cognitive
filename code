@@ -1,0 +1,353 @@
+"""
+Minimal hemispheric-asymmetry agency model
+- Model A: motor-conditioned forward model (action-conditioned)
+- Model B: drive-blind environment model (action-agnostic)
+- Dominance index: D(t) = TotalCost_B(t) - TotalCost_A(t)
+  (positive => forward model dominates => self-attribution)
+
+Reproduces:
+- D(t) time series (Fig 3A)
+- D(t) distribution (Fig 3B)
+- Stability metrics (Fig 3C-1, Fig 3C-2)
+
+No external data required.
+"""
+
+from __future__ import annotations
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# -------------------------
+# Utilities
+# -------------------------
+
+def ema(x: np.ndarray, tau: float) -> np.ndarray:
+    """
+    Exponential moving average (causal).
+    tau: integration constant (larger => smoother/longer integration).
+    """
+    if tau <= 0:
+        raise ValueError("tau must be > 0")
+    a = 1.0 / tau
+    y = np.empty_like(x, dtype=float)
+    y[0] = x[0]
+    for t in range(1, len(x)):
+        y[t] = (1 - a) * y[t - 1] + a * x[t]
+    return y
+
+
+def rolling_mean(x: np.ndarray, w: int) -> np.ndarray:
+    """Causal rolling mean with window w (w>=1)."""
+    if w < 1:
+        raise ValueError("w must be >= 1")
+    y = np.empty_like(x, dtype=float)
+    c = 0.0
+    q = []
+    for i, v in enumerate(x):
+        q.append(float(v))
+        c += float(v)
+        if len(q) > w:
+            c -= q.pop(0)
+        y[i] = c / len(q)
+    return y
+
+
+def fit_linear_forward(m: np.ndarray, s: np.ndarray) -> tuple[float, float]:
+    """
+    Fit s ~ a*m + b via least squares.
+    Returns (a, b).
+    """
+    X = np.column_stack([m, np.ones_like(m)])
+    beta, *_ = np.linalg.lstsq(X, s, rcond=None)
+    a, b = float(beta[0]), float(beta[1])
+    return a, b
+
+
+def fit_ar1(s: np.ndarray) -> tuple[float, float]:
+    """
+    Fit s[t] ~ phi*s[t-1] + c (AR(1)) via least squares.
+    Returns (phi, c).
+    """
+    if len(s) < 2:
+        raise ValueError("Need len(s) >= 2")
+    y = s[1:]
+    x = s[:-1]
+    X = np.column_stack([x, np.ones_like(x)])
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    phi, c = float(beta[0]), float(beta[1])
+    return phi, c
+
+
+# -------------------------
+# Data generator
+# -------------------------
+
+def generate_motor_command(T: int, seed: int = 0) -> np.ndarray:
+    """
+    Simple band-limited motor command: AR(1) + small sinusoid.
+    """
+    rng = np.random.default_rng(seed)
+    m = np.zeros(T, dtype=float)
+    phi = 0.98
+    noise = rng.normal(0.0, 0.4, T)
+    for t in range(1, T):
+        m[t] = phi * m[t - 1] + noise[t]
+    m += 0.5 * np.sin(2 * np.pi * np.arange(T) / 200.0)
+    return m
+
+
+def generate_sensory(
+    m: np.ndarray,
+    tau_world: int,
+    sigma: float,
+    external_mask: np.ndarray,
+    ext_amp: float = 2.0,
+    seed: int = 1
+) -> np.ndarray:
+    """
+    Sensory consequences with delay tau_world.
+    External perturbations add exogenous noise bursts when external_mask==True.
+    """
+    rng = np.random.default_rng(seed)
+    T = len(m)
+    s = np.zeros(T, dtype=float)
+
+    # delayed motor contribution
+    for t in range(T):
+        src = t - tau_world
+        motor_part = m[src] if src >= 0 else 0.0
+        s[t] = motor_part
+
+    # sensory noise
+    s += rng.normal(0.0, sigma, T)
+
+    # external perturbation: bursty exogenous input
+    burst = rng.normal(0.0, 1.0, T)
+    burst = ema(burst, tau=10.0)  # smooth burst a bit
+    s[external_mask] += ext_amp * burst[external_mask]
+    return s
+
+
+def make_intervals(T: int, period: int = 600, ext_len: int = 120) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Create alternating self-generated vs externally perturbed intervals.
+    external_mask True during ext_len portion of each period.
+    """
+    external_mask = np.zeros(T, dtype=bool)
+    for start in range(0, T, period):
+        external_mask[start:start + ext_len] = True
+    self_mask = ~external_mask
+    return self_mask, external_mask
+
+
+# -------------------------
+# Models and dominance
+# -------------------------
+
+def run_models(
+    T: int = 3000,
+    tau_world: int = 3,
+    tau_A: int = 3,
+    sigma: float = 0.25,
+    gamma: float = 0.0,
+    tau_L: float = 5.0,
+    tau_R: float = 25.0,
+    seed: int = 0,
+    symmetric_mode: str | None = None,
+) -> dict[str, np.ndarray]:
+    """
+    Returns dict with:
+      D(t), costA(t), costB(t), eA(t), eB(t), masks, etc.
+
+    symmetric_mode:
+      None: asymmetric (A motor-conditioned, B motor-blind, tau_L < tau_R)
+      "motor_aware": both models are motor-conditioned (D ~ 0 in expectation)
+      "motor_blind": both models are motor-blind (D ~ 0 in expectation)
+    """
+    # Generate intervals
+    m = generate_motor_command(T, seed=seed)
+    self_mask, external_mask = make_intervals(T)
+
+    # Generate sensory with world delay
+    s = generate_sensory(m, tau_world=tau_world, sigma=sigma, external_mask=external_mask, seed=seed + 10)
+
+    # Build regressors with assumed delay tau_A for forward model input
+    mA = np.zeros_like(m)
+    for t in range(T):
+        src = t - tau_A
+        mA[t] = m[src] if src >= 0 else 0.0
+
+    # Calibration region: first 20% of samples in self-generated (avoid external bursts)
+    calib_len = int(0.2 * T)
+    calib_idx = np.where(self_mask[:calib_len])[0]
+    if len(calib_idx) < 10:
+        calib_idx = np.arange(1, calib_len)
+
+    # Fit predictors
+    # Model A (forward): s ~ a*mA + b
+    aA, bA = fit_linear_forward(mA[calib_idx], s[calib_idx])
+
+    # Model B (environment): AR(1) on s
+    phiB, cB = fit_ar1(s[calib_idx])
+
+    # Symmetric controls: force both predictors to be the same "type"
+    if symmetric_mode == "motor_aware":
+        # Model B becomes motor-conditioned too (fit separate coefficients, same inputs)
+        aB, bB = fit_linear_forward(mA[calib_idx], s[calib_idx])
+        phiB = None
+        cB = None
+    elif symmetric_mode == "motor_blind":
+        # Model A becomes motor-blind AR(1) too
+        phiA, cA = fit_ar1(s[calib_idx])
+        aA = None
+        bA = None
+    elif symmetric_mode is not None:
+        raise ValueError("symmetric_mode must be None, 'motor_aware', or 'motor_blind'")
+
+    # Predict
+    yA = np.zeros(T, dtype=float)
+    yB = np.zeros(T, dtype=float)
+
+    for t in range(T):
+        # Model A prediction
+        if symmetric_mode == "motor_blind":
+            if t == 0:
+                yA[t] = s[t]
+            else:
+                yA[t] = phiA * s[t - 1] + cA
+        else:
+            yA[t] = aA * mA[t] + bA
+
+        # Model B prediction
+        if symmetric_mode == "motor_aware":
+            yB[t] = aB * mA[t] + bB
+        else:
+            if t == 0:
+                yB[t] = s[t]
+            else:
+                yB[t] = phiB * s[t - 1] + cB
+
+    eA = s - yA
+    eB = s - yB
+
+    # Temporal integration asymmetry applied to squared errors (cost evidence accumulation)
+    # tau_L shorter for Model A, tau_R longer for Model B in asymmetric case
+    if symmetric_mode is None:
+        mseA_t = ema(eA**2, tau=tau_L)
+        mseB_t = ema(eB**2, tau=tau_R)
+    else:
+        # symmetric controls: identical integration to avoid "cheating"
+        mseA_t = ema(eA**2, tau=(tau_L + tau_R) / 2.0)
+        mseB_t = ema(eB**2, tau=(tau_L + tau_R) / 2.0)
+
+    # Energetic/metabolic penalty: action model pays an extra term that scales with motor magnitude
+    # (keeps predictive MSE unchanged but increases total effective cost with gamma)
+    motor_energy = ema(mA**2, tau=20.0)
+    if symmetric_mode == "motor_blind":
+        # both blind => no motor energy term
+        costA = mseA_t
+        costB = mseB_t
+    elif symmetric_mode == "motor_aware":
+        # both motor-aware => both pay same energy term
+        costA = mseA_t + gamma * motor_energy
+        costB = mseB_t + gamma * motor_energy
+    else:
+        # asymmetric: only Model A pays energy term
+        costA = mseA_t + gamma * motor_energy
+        costB = mseB_t
+
+    # Dominance index: positive => Model A is cheaper (dominates)
+    D = costB - costA
+
+    return {
+        "m": m,
+        "s": s,
+        "self_mask": self_mask,
+        "external_mask": external_mask,
+        "eA": eA,
+        "eB": eB,
+        "costA": costA,
+        "costB": costB,
+        "D": D,
+    }
+
+
+# -------------------------
+# Metrics (Fig 3C)
+# -------------------------
+
+def temporal_stability_index(D: np.ndarray) -> float:
+    # inverse variance (avoid divide-by-zero)
+    v = float(np.var(D))
+    return 1.0 / (v + 1e-12)
+
+
+def attribution_consistency(D: np.ndarray, theta: float, window: int) -> float:
+    """
+    Consistency = proportion of time points that are part of a run
+    where D>theta holds for at least 'window' consecutive steps.
+    """
+    x = D > theta
+    T = len(x)
+    if window < 1 or window > T:
+        raise ValueError("bad window")
+    good = np.zeros(T, dtype=bool)
+    run = 0
+    for t in range(T):
+        if x[t]:
+            run += 1
+        else:
+            if run >= window:
+                good[t - run:t] = True
+            run = 0
+    if run >= window:
+        good[T - run:T] = True
+    return float(good.mean())
+
+
+# -------------------------
+# Plotting (Fig 3)
+# -------------------------
+
+def plot_fig3(
+    out_prefix: str | None = None,
+    T: int = 3000,
+    tau_world: int = 3,
+    tau_A: int = 3,
+    sigma: float = 0.25,
+    gamma: float = 0.0,
+    tau_L: float = 5.0,
+    tau_R: float = 25.0,
+    theta: float = 0.0,
+    window: int = 30,
+    seed: int = 0,
+):
+    # Three conditions: symmetric, asymmetric, reversed asymmetry
+    # Reversed: swap tau_L and tau_R (integration advantage flips)
+    res_sym = run_models(T=T, tau_world=tau_world, tau_A=tau_A, sigma=sigma, gamma=gamma,
+                         tau_L=tau_L, tau_R=tau_R, seed=seed, symmetric_mode="motor_aware")
+    res_asym = run_models(T=T, tau_world=tau_world, tau_A=tau_A, sigma=sigma, gamma=gamma,
+                          tau_L=tau_L, tau_R=tau_R, seed=seed, symmetric_mode=None)
+    res_rev = run_models(T=T, tau_world=tau_world, tau_A=tau_A, sigma=sigma, gamma=gamma,
+                         tau_L=tau_R, tau_R=tau_L, seed=seed, symmetric_mode=None)
+
+    D_sym, D_asym, D_rev = res_sym["D"], res_asym["D"], res_rev["D"]
+
+    # ---- Fig 3A: time series (NO legend, per your requirement)
+    plt.figure()
+    plt.plot(D_sym)
+    plt.plot(D_asym)
+    plt.plot(D_rev)
+    plt.axhline(theta, linestyle="--")
+    plt.xlabel("Time")
+    plt.ylabel("D(t)")
+    plt.title("Figure 3A: Time series of dominance index D(t)")
+    if out_prefix:
+        plt.savefig(f"{out_prefix}_Fig3A.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+    # ---- Fig 3B: distributions
+    plt.figure()
+    plt.hist(D_sym, bins=60, density=True, alpha=0.5)
+    plt.hist(D
